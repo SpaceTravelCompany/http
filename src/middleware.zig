@@ -20,6 +20,7 @@ pub const Context = struct {
     status: http.Status,
     start_ns: i64, // 처리 시작 시간 (nanoseconds)
     body_size: usize,
+    chain_state: ?*anyopaque = null, // 미들웨어 체인 상태 (Zig 0.16.0: inner fn 캡처 대체)
 };
 
 // ─────────────────────────────────────────────────────────────────────

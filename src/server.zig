@@ -266,7 +266,7 @@ pub const HttpServer = struct {
     /// 이벤트 루프 시작 (blocking)
     pub fn listen(self: *HttpServer) !void {
         // Threaded Io 생성 — http.Server init과 네트워크 accept에 사용
-        var threaded_io = try std.Io.Threaded.init(self.allocator, .{});
+        var threaded_io = std.Io.Threaded.init(self.allocator, .{});
         errdefer threaded_io.deinit();
         const io = threaded_io.io();
 
@@ -380,28 +380,38 @@ pub const HttpServer = struct {
             return;
         }
 
-        // 체인 실행 (간단한 재귀)
-        try runMiddlewareChain(middlewares, 0, &ctx, handler_fn, aa, req, res);
+        // 체인 실행 — Zig 0.16.0: inner fn 캡처 불가 → chain_state로 전달
+        var chain = MiddlewareChainState{
+            .middlewares = middlewares,
+            .index = 0,
+            .handler = handler_fn,
+            .aa = aa,
+            .req = req,
+            .res = res,
+        };
+        ctx.chain_state = @ptrCast(&chain);
+        try middlewares[0](&ctx, runNext);
     }
 };
 
-fn runMiddlewareChain(
+/// 미들웨어 체인 상태 (Zig 0.16.0: inner fn 대신 Context.chain_state에 저장)
+const MiddlewareChainState = struct {
     middlewares: []const Middleware,
     index: usize,
-    ctx: *Context,
     handler: Handler,
     aa: std.mem.Allocator,
     req: *const Request,
     res: *ResponseWriter,
-) anyerror!void {
-    if (index < middlewares.len) {
-        try middlewares[index](ctx, struct {
-            fn next(ctx2: *Context) anyerror!void {
-                try runMiddlewareChain(middlewares, index + 1, ctx2, handler, aa, req, res);
-            }
-        }.next);
+};
+
+/// 체인의 다음 미들웨어(또는 핸들러) 실행
+fn runNext(ctx: *Context) anyerror!void {
+    const chain = @as(*MiddlewareChainState, @ptrCast(@alignCast(ctx.chain_state orelse return)));
+    chain.index += 1;
+    if (chain.index < chain.middlewares.len) {
+        try chain.middlewares[chain.index](ctx, runNext);
     } else {
-        try handler(aa, req, res);
+        try chain.handler(chain.aa, chain.req, chain.res);
     }
 }
 
@@ -453,7 +463,7 @@ fn handleConnectionThread(ctx: *ConnContext) void {
     const upgrade = req_head.upgradeRequested();
     if (upgrade == .websocket) {
         const ws_key = upgrade.websocket orelse {
-            req_head.respond("Bad Request", .{ .status = .bad_request }) catch {};
+            (@constCast(&req_head)).respond("Bad Request", .{ .status = .bad_request }) catch {};
             return;
         };
 
@@ -463,7 +473,7 @@ fn handleConnectionThread(ctx: *ConnContext) void {
         // WS 라우트 매칭
         const ws_route = ctx.server.matchWsRoute(path);
         const handler = ws_route orelse {
-            req_head.respond("Bad Request", .{ .status = .bad_request }) catch {};
+            (@constCast(&req_head)).respond("Bad Request", .{ .status = .bad_request }) catch {};
             return;
         };
 
@@ -496,7 +506,7 @@ fn handleConnectionThread(ctx: *ConnContext) void {
         }
 
         // WebSocket upgrade
-        var ws_stream = websocket.server.WsStream.upgrade(aa, &req_head, .{
+        var ws_stream = websocket.server.WsStream.upgrade(aa, @constCast(&req_head), .{
             .key = ws_key,
             .protocol = selected_protocol,
             .max_message_size = handler.max_message_size,
@@ -535,7 +545,7 @@ fn handleConnectionThread(ctx: *ConnContext) void {
                     error.FileNotFound => .not_found,
                     else => .internal_server_error,
                 };
-                req_head.respond("", .{ .status = status }) catch {};
+                (@constCast(&req_head)).respond("", .{ .status = status }) catch {};
                 return;
             };
             defer static_result.deinit();
@@ -545,9 +555,9 @@ fn handleConnectionThread(ctx: *ConnContext) void {
                 .{ .name = "ETag", .value = static_result.etag },
                 .{ .name = "Last-Modified", .value = static_result.last_modified },
             };
-            if (requestHeaderValue(req_head, "if-none-match")) |if_none_match| {
+            if (requestHeaderValue(&req_head, "if-none-match")) |if_none_match| {
                 if (etagMatches(if_none_match, static_result.etag)) {
-                    req_head.respond("", .{
+                    (@constCast(&req_head)).respond("", .{
                         .status = .not_modified,
                         .extra_headers = &extra_headers,
                     }) catch {};
@@ -561,16 +571,16 @@ fn handleConnectionThread(ctx: *ConnContext) void {
             appendHeader(&response_headers, &response_header_count, "ETag", static_result.etag);
             appendHeader(&response_headers, &response_header_count, "Last-Modified", static_result.last_modified);
 
-            var compressed = try compressStaticBody(aa, static_result.body, requestHeaderValue(req_head, "accept-encoding"), &response_headers, &response_header_count);
+            var compressed = compressStaticBody(aa, static_result.body, requestHeaderValue(&req_head, "accept-encoding"), &response_headers, &response_header_count) catch |err| { std.debug.print("compress error: {}\n", .{err}); return; };
             defer compressed.deinit(aa);
 
-            req_head.respond(compressed.body, .{
+            (@constCast(&req_head)).respond(compressed.body, .{
                 .status = .ok,
                 .extra_headers = response_headers[0..response_header_count],
             }) catch {};
             return;
         }
-        req_head.respond("", .{ .status = .not_found }) catch {};
+        (@constCast(&req_head)).respond("", .{ .status = .not_found }) catch {};
         return;
     };
 
@@ -586,7 +596,7 @@ fn handleConnectionThread(ctx: *ConnContext) void {
     }
 
     var body_buf: [8192]u8 = undefined;
-    var body_reader = req_head.readerExpectNone(&body_buf);
+    var body_reader = (@constCast(&req_head)).readerExpectNone(&body_buf);
     const body = body_reader.allocRemaining(aa, .unlimited) catch |err| {
         std.debug.print("[HTTP] body read error: {}\n", .{err});
         return;
@@ -601,15 +611,14 @@ fn handleConnectionThread(ctx: *ConnContext) void {
     };
 
     var res = ResponseWriter.init(aa);
-    res.server_req = &req_head;
+    res.server_req = @constCast(&req_head);
     res.accept_encoding = headers.get("accept-encoding");
 
     // 미들웨어 체인 실행 → handler 호출 (handler에 aa 전달)
-    const err = ctx.server.runMiddleware(aa, &req, &res, handler);
-    if (err) |e| {
-        std.debug.print("[HTTP] handler error for {s} {s}: {}\n", .{ @tagName(method), path, e });
-        req_head.respond("Internal Server Error", .{ .status = .internal_server_error }) catch {};
-    }
+    ctx.server.runMiddleware(aa, &req, &res, handler) catch {
+        std.debug.print("[HTTP] handler error for {s} {s}\n", .{ @tagName(method), path });
+        (@constCast(&req_head)).respond("Internal Server Error", .{ .status = .internal_server_error }) catch {};
+    };
     // arena.deinit()이 모든 할당(headers, body, res, handler 임시)을 한 번에 해제
 }
 
