@@ -1,0 +1,20 @@
+.{
+    .minimum_zig_version = "0.16.0",
+    .name = .http,
+    .fingerprint = 0xc7d9a3b8e5f14062,
+    .version = "0.1.0",
+    .description = "http — engine2 공용 HTTP 서버/클라이언트/웹소켓 패키지",
+    .copyright = "",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+    .dependencies = .{
+        .utils = .{
+            .url = "https://github.com/SpaceTravelCompany/utils/archive/refs/heads/main.tar.gz",
+            .hash = "utils-0.1.0-pCzdT0nrAADMPQSwx5MUM3bphu4CZuSlHYmM5M8rcHRS",
+        },
+    },
+}
