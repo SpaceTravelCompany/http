@@ -13,8 +13,8 @@ const std = @import("std");
 const mem = std.mem;
 const http = @import("mod.zig");
 
-/// Zig #25015 hang 버그 회피: write_buffer_size를 충분히 크게 설정
 pub const WriteBufferSize: usize = 16384;
+pub const MaxBufferedBodySize: u64 = 16 * 1024 * 1024;
 
 // ─────────────────────────────────────────────────────────────────────
 //  HttpClient
@@ -81,6 +81,14 @@ pub const HttpClient = struct {
 
     /// 범용 fetch: 원샷 HTTP 요청. body 버퍼링.
     pub fn fetch(self: *HttpClient, allocator: std.mem.Allocator, opts: FetchOptions) !Response {
+        if (opts.timeout_ms) |timeout_ms| {
+            return try fetchWithTimeout(self, allocator, opts, timeout_ms);
+        }
+
+        return try fetchInternal(self, allocator, opts);
+    }
+
+    fn fetchInternal(self: *HttpClient, allocator: std.mem.Allocator, opts: FetchOptions) !Response {
         const uri = try std.Uri.parse(opts.url);
 
         // retry 루프
@@ -149,21 +157,11 @@ pub const HttpClient = struct {
             const status = std_response.head.status;
 
             // 응답 본문 읽기
-            var body_writer: std.Io.Writer.Allocating = .init(allocator);
-            errdefer body_writer.deinit();
-
-            var transfer_buf: [64]u8 = undefined;
-            const body_reader = std_response.reader(&transfer_buf);
-            _ = body_reader.streamRemaining(&body_writer.writer) catch |err| {
-                const mapped_err = switch (err) {
-                    error.ReadFailed => std_response.bodyErr() orelse err,
-                    else => err,
-                };
-                last_err = mapped_err;
-                if (isRetryableNetworkError(mapped_err) and retry_i + 1 < max_retries) continue;
-                return mapped_err;
+            const body = readResponseBody(allocator, &req, &std_response) catch |err| {
+                last_err = err;
+                if (isRetryableNetworkError(err) and retry_i + 1 < max_retries) continue;
+                return err;
             };
-            const body = try body_writer.toOwnedSlice();
 
             // 5xx 재시도
             if (isServerError(status) and retry_i + 1 < max_retries) {
@@ -195,6 +193,8 @@ pub const FetchOptions = struct {
     url: []const u8,
     headers: ?[]const HeaderEntry = null,
     body: ?[]const u8 = null,
+    /// 요청 전체 제한 시간. null이면 제한 없음.
+    timeout_ms: ?u64 = null,
 };
 
 pub const HeaderEntry = struct {
@@ -244,6 +244,50 @@ fn isRetryableNetworkError(err: anyerror) bool {
     };
 }
 
+const FetchSelectResult = union(enum) {
+    response: anyerror!Response,
+    timeout: anyerror!void,
+};
+
+fn fetchWithTimeout(
+    self: *HttpClient,
+    allocator: std.mem.Allocator,
+    opts: FetchOptions,
+    timeout_ms: u64,
+) !Response {
+    var select_buffer: [2]FetchSelectResult = undefined;
+    var select = std.Io.Select(FetchSelectResult).init(self.client.io, &select_buffer);
+
+    var worker_opts = opts;
+    worker_opts.timeout_ms = null;
+
+    select.async(.response, fetchWorker, .{ self, allocator, worker_opts });
+    select.async(.timeout, timeoutWorker, .{ self.client.io, timeout_ms });
+
+    const result = try select.await();
+    switch (result) {
+        .response => |response_result| {
+            defer select.cancelDiscard();
+            return response_result;
+        },
+        .timeout => |timeout_result| {
+            _ = timeout_result catch {};
+            select.cancelDiscard();
+            return error.Timeout;
+        },
+    }
+}
+
+fn fetchWorker(self: *HttpClient, allocator: std.mem.Allocator, opts: FetchOptions) anyerror!Response {
+    return self.fetchInternal(allocator, opts);
+}
+
+fn timeoutWorker(io: std.Io, timeout_ms: u64) anyerror!void {
+    const duration = std.Io.Duration.fromMilliseconds(@intCast(timeout_ms));
+    try std.Io.sleep(io, duration, .awake);
+    return error.Timeout;
+}
+
 // ─────────────────────────────────────────────────────────────────────
 //  테스트
 // ─────────────────────────────────────────────────────────────────────
@@ -255,6 +299,83 @@ test "client — init/deinit" {
     defer client.deinit();
     try testing.expect(client.allocator.ptr == testing.allocator.ptr);
     try testing.expect(client.allocator.vtable == testing.allocator.vtable);
+}
+
+fn readResponseBody(
+    allocator: std.mem.Allocator,
+    req: *std.http.Client.Request,
+    response: *std.http.Client.Response,
+) ![]u8 {
+    const encoded_body = try readEncodedResponseBody(allocator, req, response);
+
+    if (response.head.content_encoding == .identity) return encoded_body;
+    defer allocator.free(encoded_body);
+
+    return try decompressResponseBody(allocator, encoded_body, response.head.content_encoding);
+}
+
+fn readEncodedResponseBody(
+    allocator: std.mem.Allocator,
+    req: *std.http.Client.Request,
+    response: *std.http.Client.Response,
+) ![]u8 {
+    return switch (response.head.transfer_encoding) {
+        .none => blk: {
+            const content_length = response.head.content_length orelse return try allocator.alloc(u8, 0);
+            if (content_length > MaxBufferedBodySize) return error.StreamTooLong;
+            break :blk req.reader.in.readAlloc(allocator, @intCast(content_length));
+        },
+        .chunked => blk: {
+            var transfer_buffer: [64]u8 = undefined;
+            const body_reader = req.reader.bodyReader(&transfer_buffer, .chunked, null);
+            break :blk readBodyReaderAlloc(allocator, body_reader);
+        },
+    };
+}
+
+fn decompressResponseBody(
+    allocator: std.mem.Allocator,
+    encoded_body: []const u8,
+    content_encoding: std.http.ContentEncoding,
+) ![]u8 {
+    if (encoded_body.len == 0) return try allocator.alloc(u8, 0);
+
+    const buffer_len: usize = switch (content_encoding) {
+        .identity => return try allocator.dupe(u8, encoded_body),
+        .gzip, .deflate => std.compress.flate.max_window_len,
+        .zstd => std.compress.zstd.default_window_len,
+        .compress => return error.UnsupportedCompressionMethod,
+    };
+
+    const decompress_buffer = try allocator.alloc(u8, buffer_len);
+    defer allocator.free(decompress_buffer);
+
+    var input: std.Io.Reader = .fixed(encoded_body);
+    var decompress: std.http.Decompress = undefined;
+    const reader = decompress.init(&input, decompress_buffer, content_encoding);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    _ = try reader.streamRemaining(&out.writer);
+    if (out.written().len > MaxBufferedBodySize) return error.StreamTooLong;
+    return try out.toOwnedSlice();
+}
+
+fn readBodyReaderAlloc(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+
+    while (true) {
+        var buf: [4096]u8 = undefined;
+        const n = reader.readSliceShort(&buf) catch |err| switch (err) {
+            error.ReadFailed => return error.ReadFailed,
+        };
+        if (n == 0) break;
+        if (out.written().len + n > MaxBufferedBodySize) return error.StreamTooLong;
+        try out.writer.writeAll(buf[0..n]);
+    }
+
+    return try out.toOwnedSlice();
 }
 
 fn skipNetworkTests() bool {
@@ -287,6 +408,34 @@ test "client — isServerError" {
     try testing.expect(isServerError(@as(http.Status, @enumFromInt(503))));
     try testing.expect(!isServerError(@as(http.Status, @enumFromInt(200))));
     try testing.expect(!isServerError(@as(http.Status, @enumFromInt(404))));
+}
+
+test "client — decompress gzip response body" {
+    const compressed = try gzipForTest(testing.allocator, "hello compressed");
+    defer testing.allocator.free(compressed);
+
+    const plain = try decompressResponseBody(testing.allocator, compressed, .gzip);
+    defer testing.allocator.free(plain);
+
+    try testing.expectEqualStrings("hello compressed", plain);
+}
+
+fn gzipForTest(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = try .initCapacity(allocator, @max(body.len + 32, 64));
+    errdefer out.deinit();
+
+    const work = try allocator.alloc(u8, std.compress.flate.max_window_len);
+    defer allocator.free(work);
+
+    var encoder = try std.compress.flate.Compress.init(
+        &out.writer,
+        work,
+        .gzip,
+        .default,
+    );
+    try encoder.writer.writeAll(body);
+    try encoder.finish();
+    return try out.toOwnedSlice();
 }
 
 

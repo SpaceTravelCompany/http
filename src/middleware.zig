@@ -21,6 +21,8 @@ pub const Context = struct {
     start_ns: i64, // 처리 시작 시간 (nanoseconds)
     body_size: usize,
     chain_state: ?*anyopaque = null, // 미들웨어 체인 상태 (Zig 0.16.0: inner fn 캡처 대체)
+    io: std.Io, // Io 인스턴서 (logger 등에서 사용)
+    res: ?*http.server.ResponseWriter = null, // 응답 빌더 (CORS 등에서 사용)
 };
 
 // ─────────────────────────────────────────────────────────────────────
@@ -29,7 +31,7 @@ pub const Context = struct {
 
 /// 요청 로깅 미들웨어. 처리 시간, 메서드, 경로, 상태 코드를 기록한다.
 pub fn logger(ctx: *Context, next: *const fn (ctx: *Context) anyerror!void) anyerror!void {
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = ctx.io;
     const start = std.Io.Timestamp.toMilliseconds(
         std.Io.Timestamp.now(io, .awake),
     );
@@ -63,18 +65,53 @@ pub const CorsOptions = struct {
 
 /// CORS 미들웨어 생성 팩토리.
 pub fn cors(options: CorsOptions) Middleware {
-    _ = options;
     return struct {
         fn handler(ctx: *Context, next: *const fn (ctx: *Context) anyerror!void) anyerror!void {
-            // 실제 응답 헤더 설정은 ResponseWriter가 처리.
-            // 여기서는 OPTIONS preflight 처리만 담당.
+            const res = ctx.res orelse return;
+
+            // CORS 헤더 설정
+            const origin = if (options.allowed_origins.len > 0 and options.allowed_origins[0].len > 0 and options.allowed_origins[0][0] != '*')
+                options.allowed_origins[0]
+            else
+                "*";
+            res.setHeader("Access-Control-Allow-Origin", origin) catch {};
+            res.setHeader("Access-Control-Allow-Methods", joinWith(options.allowed_methods, ", ")) catch {};
+            res.setHeader("Access-Control-Allow-Headers", joinWith(options.allowed_headers, ", ")) catch {};
+            if (options.allow_credentials) {
+                res.setHeader("Access-Control-Allow-Credentials", "true") catch {};
+            }
+            if (options.max_age) |age| {
+                const age_str = std.fmt.allocPrint(res.headers.entries.allocator, "{d}", .{age}) catch return;
+                defer res.headers.entries.allocator.free(age_str);
+                res.setHeader("Access-Control-Max-Age", age_str) catch {};
+            }
+
+            // OPTIONS preflight → 체인 종료, 204 반환
             if (ctx.method == .OPTIONS) {
                 ctx.status = .no_content;
-                return; // Preflight: 체인 종료, 204 반환
+                return;
             }
             try next(ctx);
         }
     }.handler;
+}
+
+/// 문자열 배열을 구분자로 연결. 스택 버퍼 사용 (짧은 CORS 헤더에 적합).
+fn joinWith(items: []const []const u8, sep: []const u8) []const u8 {
+    // 고정 버퍼 — CORS 헤더는 보통 256바이트 이내
+    var buf: [512]u8 = undefined;
+    var pos: usize = 0;
+    for (items, 0..) |item, i| {
+        if (i > 0) {
+            const copy_len = @min(sep.len, buf.len - pos);
+            @memcpy(buf[pos..pos + copy_len], sep[0..copy_len]);
+            pos += copy_len;
+        }
+        const copy_len = @min(item.len, buf.len - pos);
+        @memcpy(buf[pos..pos + copy_len], item[0..copy_len]);
+        pos += copy_len;
+    }
+    return buf[0..pos];
 }
 
 // ─────────────────────────────────────────────────────────────────────

@@ -231,7 +231,7 @@ pub const HttpServer = struct {
     pub fn serveStatic(self: *HttpServer, prefix: []const u8, dir: []const u8) !void {
         try self.static_routes.append(self.allocator, .{
             .prefix = try self.allocator.dupe(u8, prefix),
-            .server = http.static.StaticServer.init(self.allocator, dir),
+            .server = try http.static.StaticServer.init(self.allocator, dir),
         });
     }
 
@@ -292,11 +292,19 @@ pub const HttpServer = struct {
         // Threaded Io는 listen()이 반환할 때 해제되지만,
         // while(true) 루프이므로 실제로는 listen()이 종료되지 않는다.
 
+        var consecutive_accept_errors: u32 = 0;
         while (true) {
             const conn = listener.accept(io) catch |err| {
-                std.debug.print("[HTTP] accept error: {}\n", .{err});
+                consecutive_accept_errors += 1;
+                std.debug.print("[HTTP] accept error (#{d}): {}\n", .{ consecutive_accept_errors, err });
+                // 연속 에러 시 백오프 (최대 1초)
+                if (consecutive_accept_errors > 3) {
+                    const backoff_ms = @min(@as(u64, 1000), @as(u64, 50) << @intCast(@min(consecutive_accept_errors - 4, 10)));
+                    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(@intCast(backoff_ms)), .awake) catch {};
+                }
                 continue;
             };
+            consecutive_accept_errors = 0;
 
             // 각 커넥션을 개별 스레드로 처리
             const ctx = try self.allocator.create(ConnContext);
@@ -363,7 +371,7 @@ pub const HttpServer = struct {
         return self.matchStaticRoute(path);
     }
 
-    fn runMiddleware(self: *HttpServer, aa: std.mem.Allocator, req: *const Request, res: *ResponseWriter, handler: Handler) !void {
+    fn runMiddleware(self: *HttpServer, aa: std.mem.Allocator, io: std.Io, req: *const Request, res: *ResponseWriter, handler: Handler) !void {
         const middlewares = self.middlewares.items;
         const handler_fn = handler;
 
@@ -373,6 +381,8 @@ pub const HttpServer = struct {
             .status = .ok,
             .start_ns = 0,
             .body_size = if (req.body) |b| b.len else 0,
+            .io = io,
+            .res = res,
         };
 
         if (middlewares.len == 0) {
@@ -430,6 +440,18 @@ fn connectionWorkerCount() usize {
     return @max(std.Thread.getCpuCount() catch 1, 1);
 }
 
+fn isQuietReceiveHeadError(err: anyerror) bool {
+    return switch (err) {
+        error.HttpConnectionClosing,
+        error.ConnectionResetByPeer,
+        error.BrokenPipe,
+        error.EndOfStream,
+        error.Canceled,
+        => true,
+        else => false,
+    };
+}
+
 /// ThreadPool worker entry. Task.data는 `ConnContext` 포인터다.
 fn handleConnectionTask(data: ?*anyopaque) void {
     const ctx = @as(*ConnContext, @ptrCast(@alignCast(data)));
@@ -455,6 +477,7 @@ fn handleConnectionThread(ctx: *ConnContext) void {
 
     var server = std.http.Server.init(&stream_reader.interface, &stream_writer.interface);
     const req_head = server.receiveHead() catch |err| {
+        if (isQuietReceiveHeadError(err)) return;
         std.debug.print("[HTTP] receiveHead error: {}\n", .{err});
         return;
     };
@@ -591,6 +614,8 @@ fn handleConnectionThread(ctx: *ConnContext) void {
         while (it.next()) |hdr| {
             headers.set(hdr.name, hdr.value) catch |err| {
                 std.debug.print("[HTTP] header parse error: {}\n", .{err});
+                (@constCast(&req_head)).respond("Internal Server Error", .{ .status = .internal_server_error }) catch {};
+                return;
             };
         }
     }
@@ -615,9 +640,11 @@ fn handleConnectionThread(ctx: *ConnContext) void {
     res.accept_encoding = headers.get("accept-encoding");
 
     // 미들웨어 체인 실행 → handler 호출 (handler에 aa 전달)
-    ctx.server.runMiddleware(aa, &req, &res, handler) catch {
+    ctx.server.runMiddleware(aa, ctx.io, &req, &res, handler) catch {
         std.debug.print("[HTTP] handler error for {s} {s}\n", .{ @tagName(method), path });
-        (@constCast(&req_head)).respond("Internal Server Error", .{ .status = .internal_server_error }) catch {};
+        if (!res.has_sent) {
+            (@constCast(&req_head)).respond("Internal Server Error", .{ .status = .internal_server_error }) catch {};
+        }
     };
     // arena.deinit()이 모든 할당(headers, body, res, handler 임시)을 한 번에 해제
 }

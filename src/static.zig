@@ -27,10 +27,11 @@ pub const StaticServer = struct {
     /// 500 페이지 (null이면 기본 메시지)
     error_page: ?[]const u8 = null,
 
-    pub fn init(allocator: std.mem.Allocator, root_dir: []const u8) StaticServer {
+    pub fn init(allocator: std.mem.Allocator, root_dir: []const u8) !StaticServer {
+        const resolved = std.fs.path.resolve(allocator, &.{root_dir}) catch try allocator.dupe(u8, root_dir);
         return .{
             .allocator = allocator,
-            .root_dir = std.fs.path.resolve(allocator, &.{root_dir}) catch allocator.dupe(u8, root_dir) catch root_dir,
+            .root_dir = resolved,
         };
     }
 
@@ -223,12 +224,12 @@ test "static — format Last-Modified date" {
 }
 
 test "static — StaticServer init/deinit" {
-    var ss = StaticServer.init(testing.allocator, "/tmp/www");
+    var ss = try StaticServer.init(testing.allocator, "/tmp/www");
     ss.deinit();
 }
 
 test "static — serve with missing file returns error" {
-    var ss = StaticServer.init(testing.allocator, "/nonexistent_dir_xyz");
+    var ss = try StaticServer.init(testing.allocator, "/nonexistent_dir_xyz");
     defer ss.deinit();
 
     var threaded: std.Io.Threaded = std.Io.Threaded.init(testing.allocator, .{});
@@ -258,7 +259,7 @@ test "static — serve returns sha256 etag" {
     const root = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer testing.allocator.free(root);
 
-    var ss = StaticServer.init(testing.allocator, root);
+    var ss = try StaticServer.init(testing.allocator, root);
     defer ss.deinit();
 
     var result = try ss.serveFromIo(io, "/index.html");

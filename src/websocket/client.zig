@@ -168,7 +168,8 @@ pub const WsStream = struct {
         if (!accept_found) return error.HandshakeFailed;
 
         // Validate Sec-WebSocket-Protocol
-        var selected_protocol: ?[]const u8 = null;
+        var selected_protocol: ?[]u8 = null;
+        errdefer if (selected_protocol) |p| allocator.free(p);
         {
             var it = response.iterateHeaders();
             while (it.next()) |hdr| {
@@ -178,7 +179,7 @@ pub const WsStream = struct {
                     if (!ws.subprotocol.validateSelected(srv_proto, opts.protocols)) {
                         return error.HandshakeFailed;
                     }
-                    selected_protocol = srv_proto;
+                    selected_protocol = try allocator.dupe(u8, srv_proto);
                     break;
                 }
             }

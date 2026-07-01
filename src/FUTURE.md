@@ -2,9 +2,8 @@
 
 ## 타임아웃
 
-- `Io` 레벨 deadline 구현 복잡도 높음
-- 연결 타임아웃은 현재 stdlib 기본(OS 디폴트)만 사용
-- FUTURE: client.fetch()에 timeout_ms 옵션 추가
+- ✅ `client.fetch()`에 `timeout_ms` 옵션 추가
+- `std.http.Client` 직접 연결 timeout 주입은 stdlib 내부 연결 생성 경계 때문에 별도 추적
 
 ## HMAC-SHA256 서명
 
@@ -103,6 +102,5 @@
 
 ## 타임아웃
 
-- `Io` 레벨 deadline 구현 복잡도 높음
-- 연결 타임아웃은 현재 stdlib 기본(OS 디폴트)만 사용
-- FUTURE: client.fetch()에 timeout_ms 옵션 추가
+- ✅ `client.fetch()`에 `timeout_ms` 옵션 추가
+- `std.http.Client` 직접 연결 timeout 주입은 stdlib 내부 연결 생성 경계 때문에 별도 추적
