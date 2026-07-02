@@ -64,31 +64,37 @@ pub const CorsOptions = struct {
 };
 
 /// CORS 미들웨어 생성 팩토리.
-pub fn cors(options: CorsOptions) Middleware {
+pub fn cors(comptime options: CorsOptions) Middleware {
     return struct {
+        const AllowedOrigin = corsAllowedOrigin(options.allowed_origins);
+        const AllowedMethods = options.allowed_methods;
+        const AllowedHeaders = options.allowed_headers;
+        const AllowCredentials = options.allow_credentials;
+        const MaxAge = options.max_age;
+
         fn handler(ctx: *Context, next: *const fn (ctx: *Context) anyerror!void) anyerror!void {
             const res = ctx.res orelse return;
+            const allocator = res.headers.entries.allocator;
 
             // CORS 헤더 설정
-            const origin = if (options.allowed_origins.len > 0 and options.allowed_origins[0].len > 0 and options.allowed_origins[0][0] != '*')
-                options.allowed_origins[0]
-            else
-                "*";
-            res.setHeader("Access-Control-Allow-Origin", origin) catch {};
-            res.setHeader("Access-Control-Allow-Methods", joinWith(options.allowed_methods, ", ")) catch {};
-            res.setHeader("Access-Control-Allow-Headers", joinWith(options.allowed_headers, ", ")) catch {};
-            if (options.allow_credentials) {
+            try res.setHeader("Access-Control-Allow-Origin", AllowedOrigin);
+            const methods = try std.mem.join(allocator, ", ", AllowedMethods);
+            try res.setHeader("Access-Control-Allow-Methods", methods);
+            const headers = try std.mem.join(allocator, ", ", AllowedHeaders);
+            try res.setHeader("Access-Control-Allow-Headers", headers);
+            if (AllowCredentials) {
                 res.setHeader("Access-Control-Allow-Credentials", "true") catch {};
             }
-            if (options.max_age) |age| {
-                const age_str = std.fmt.allocPrint(res.headers.entries.allocator, "{d}", .{age}) catch return;
-                defer res.headers.entries.allocator.free(age_str);
-                res.setHeader("Access-Control-Max-Age", age_str) catch {};
+            if (MaxAge) |age| {
+                const age_str = try std.fmt.allocPrint(allocator, "{d}", .{age});
+                try res.setHeader("Access-Control-Max-Age", age_str);
             }
 
             // OPTIONS preflight → 체인 종료, 204 반환
             if (ctx.method == .OPTIONS) {
                 ctx.status = .no_content;
+                res.setStatus(.no_content);
+                try res.send("");
                 return;
             }
             try next(ctx);
@@ -96,22 +102,11 @@ pub fn cors(options: CorsOptions) Middleware {
     }.handler;
 }
 
-/// 문자열 배열을 구분자로 연결. 스택 버퍼 사용 (짧은 CORS 헤더에 적합).
-fn joinWith(items: []const []const u8, sep: []const u8) []const u8 {
-    // 고정 버퍼 — CORS 헤더는 보통 256바이트 이내
-    var buf: [512]u8 = undefined;
-    var pos: usize = 0;
-    for (items, 0..) |item, i| {
-        if (i > 0) {
-            const copy_len = @min(sep.len, buf.len - pos);
-            @memcpy(buf[pos..pos + copy_len], sep[0..copy_len]);
-            pos += copy_len;
-        }
-        const copy_len = @min(item.len, buf.len - pos);
-        @memcpy(buf[pos..pos + copy_len], item[0..copy_len]);
-        pos += copy_len;
+fn corsAllowedOrigin(comptime origins: []const []const u8) []const u8 {
+    if (origins.len > 0 and origins[0].len > 0 and origins[0][0] != '*') {
+        return origins[0];
     }
-    return buf[0..pos];
+    return "*";
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -120,7 +115,14 @@ fn joinWith(items: []const []const u8, sep: []const u8) []const u8 {
 
 const testing = std.testing;
 
+fn testNext(ctx: *Context) anyerror!void {
+    ctx.status = .accepted;
+}
 
+fn failNext(ctx: *Context) anyerror!void {
+    _ = ctx;
+    return error.NextCalled;
+}
 
 test "middleware — cors with options" {
     const mw = cors(.{
@@ -129,4 +131,60 @@ test "middleware — cors with options" {
         .max_age = 86400,
     });
     _ = mw;
+}
+
+test "middleware — cors sets configured headers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var res = http.server.ResponseWriter.init(allocator);
+    var ctx = Context{
+        .method = .GET,
+        .path = "/",
+        .status = .ok,
+        .start_ns = 0,
+        .body_size = 0,
+        .io = undefined,
+        .res = &res,
+    };
+
+    const mw = cors(.{
+        .allowed_origins = &.{"https://example.com"},
+        .allowed_methods = &.{ "GET", "POST" },
+        .allowed_headers = &.{ "Content-Type", "X-Test" },
+        .allow_credentials = true,
+        .max_age = 86400,
+    });
+    try mw(&ctx, testNext);
+
+    try testing.expectEqual(.accepted, ctx.status);
+    try testing.expectEqualStrings("https://example.com", res.headers.get("Access-Control-Allow-Origin").?);
+    try testing.expectEqualStrings("GET, POST", res.headers.get("Access-Control-Allow-Methods").?);
+    try testing.expectEqualStrings("Content-Type, X-Test", res.headers.get("Access-Control-Allow-Headers").?);
+    try testing.expectEqualStrings("true", res.headers.get("Access-Control-Allow-Credentials").?);
+    try testing.expectEqualStrings("86400", res.headers.get("Access-Control-Max-Age").?);
+}
+
+test "middleware — cors preflight ends chain" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var res = http.server.ResponseWriter.init(arena.allocator());
+    var ctx = Context{
+        .method = .OPTIONS,
+        .path = "/",
+        .status = .ok,
+        .start_ns = 0,
+        .body_size = 0,
+        .io = undefined,
+        .res = &res,
+    };
+
+    const mw = cors(.{});
+    try mw(&ctx, failNext);
+
+    try testing.expectEqual(.no_content, ctx.status);
+    try testing.expectEqual(.no_content, res.status);
+    try testing.expect(res.has_sent);
 }
