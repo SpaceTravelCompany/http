@@ -34,6 +34,11 @@ pub const MultipartResult = struct {
     pub fn deinit(self: *MultipartResult, allocator: std.mem.Allocator) void {
         for (self.files) |*f| f.deinit(allocator);
         allocator.free(self.files);
+        var field_it = self.fields.iterator();
+        while (field_it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
         self.fields.deinit();
     }
 };
@@ -88,7 +93,13 @@ pub fn parseMultipart(allocator: std.mem.Allocator, content_type: []const u8, bo
 
         const raw_headers = part_data[0..header_end];
         const content_start = header_end + (if (mem.startsWith(u8, part_data[header_end..], "\r\n\r\n")) @as(usize, 4) else 2);
-        const content = if (content_start <= part_data.len) part_data[content_start..] else "";
+        // MIME 규격: part 데이터와 boundary 사이의 \r\n은 구분자이므로 content에서 제거
+        const raw_content = if (content_start <= part_data.len) part_data[content_start..] else "";
+        const content_end = if (raw_content.len >= 2 and raw_content[raw_content.len - 2] == '\r' and raw_content[raw_content.len - 1] == '\n')
+            raw_content.len - 2
+        else
+            raw_content.len;
+        const content = raw_content[0..content_end];
 
         // Content-Disposition 파싱
         const disposition = extractHeaderValue(raw_headers, "Content-Disposition") orelse continue;
@@ -106,9 +117,8 @@ pub fn parseMultipart(allocator: std.mem.Allocator, content_type: []const u8, bo
             };
             try files.append(allocator, file);
         } else {
-            // 일반 폼 필드
-            const trimmed = std.mem.trimRight(u8, content, "\r\n \t");
-            try fields.put(try allocator.dupe(u8, field_name), try allocator.dupe(u8, trimmed));
+            // 일반 폼 필드 (\r\n은 이미 제거됨)
+            try fields.put(try allocator.dupe(u8, field_name), try allocator.dupe(u8, content));
         }
 
         pos = next_b;
@@ -140,7 +150,7 @@ fn extractHeaderValue(raw_headers: []const u8, name: []const u8) ?[]const u8 {
     while (lines.next()) |line| {
         if (line.len == 0) continue;
         const colon = mem.indexOfScalar(u8, line, ':') orelse continue;
-        if (mem.eql(u8, std.mem.trimRight(u8, line[0..colon], " \t"), name)) {
+        if (mem.eql(u8, std.mem.trimEnd(u8, line[0..colon], " \t"), name)) {
             return std.mem.trim(u8, line[colon + 1 ..], " \t\r\n");
         }
     }
@@ -202,7 +212,7 @@ test "upload — parseMultipart minimal" {
         "value1\r\n" ++
         "--boundary123--\r\n";
 
-    const result = try parseMultipart(allocator, "multipart/form-data; boundary=" ++ boundary, body);
+    var result = try parseMultipart(allocator, "multipart/form-data; boundary=" ++ boundary, body);
     defer result.deinit(allocator);
 
     try testing.expectEqual(@as(usize, 0), result.files.len);

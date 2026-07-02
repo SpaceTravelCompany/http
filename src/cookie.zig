@@ -77,6 +77,8 @@ pub const CookieJar = struct {
             .name = name,
             .value = value,
         };
+        // OOM 시 cookie 구조체의 모든 할당된 필드 해제
+        errdefer cookie.deinit(self.allocator);
 
         // 속성 파싱
         var pos = semi_pos;

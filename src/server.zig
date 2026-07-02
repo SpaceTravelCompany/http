@@ -172,6 +172,7 @@ pub const HttpServer = struct {
     ws_routes: std.ArrayList(WsRoute),
     static_routes: std.ArrayList(StaticRoute),
     middlewares: std.ArrayList(Middleware),
+    max_body_size: usize = 16 * 1024 * 1024, // 기본 16 MiB
 
     pub fn init(allocator: std.mem.Allocator, port: u16) HttpServer {
         return .{
@@ -322,7 +323,7 @@ pub const HttpServer = struct {
 
         for (self.routes.items) |route| {
             if (route.method != method) continue;
-            if (mem.startsWith(u8, path, route.prefix)) {
+            if (pathMatchesRoutePrefix(path, route.prefix)) {
                 if (route.prefix.len > best_len) {
                     best = route.handler;
                     best_len = route.prefix.len;
@@ -338,7 +339,7 @@ pub const HttpServer = struct {
         var best_len: usize = 0;
 
         for (self.ws_routes.items) |*route| {
-            if (mem.startsWith(u8, path, route.prefix)) {
+            if (pathMatchesRoutePrefix(path, route.prefix)) {
                 if (route.prefix.len > best_len) {
                     best = route;
                     best_len = route.prefix.len;
@@ -379,7 +380,7 @@ pub const HttpServer = struct {
             .method = req.method,
             .path = req.path,
             .status = .ok,
-            .start_ns = 0,
+            .start_ms = 0,
             .body_size = if (req.body) |b| b.len else 0,
             .io = io,
             .res = res,
@@ -622,7 +623,7 @@ fn handleConnectionThread(ctx: *ConnContext) void {
 
     var body_buf: [8192]u8 = undefined;
     var body_reader = (@constCast(&req_head)).readerExpectNone(&body_buf);
-    const body = body_reader.allocRemaining(aa, .unlimited) catch |err| {
+    const body = body_reader.allocRemaining(aa, .limited(ctx.server.max_body_size)) catch |err| {
         std.debug.print("[HTTP] body read error: {}\n", .{err});
         return;
     };

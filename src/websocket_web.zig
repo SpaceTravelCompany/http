@@ -175,7 +175,8 @@ const testing = std.testing;
 test "websocket_web — init/deinit" {
     var ws = WebWebSocket.init(testing.allocator);
     defer ws.deinit();
-    try testing.expect(ws.allocator == testing.allocator);
+    try testing.expect(ws.allocator.ptr == testing.allocator.ptr);
+    try testing.expect(ws.allocator.vtable == testing.allocator.vtable);
 }
 
 test "websocket_web — poll noop" {

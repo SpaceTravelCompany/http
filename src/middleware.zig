@@ -18,7 +18,7 @@ pub const Context = struct {
     method: http.Method,
     path: []const u8,
     status: http.Status,
-    start_ns: i64, // 처리 시작 시간 (nanoseconds)
+    start_ms: i64, // 처리 시작 시간 (milliseconds)
     body_size: usize,
     chain_state: ?*anyopaque = null, // 미들웨어 체인 상태 (Zig 0.16.0: inner fn 캡처 대체)
     io: std.Io, // Io 인스턴서 (logger 등에서 사용)
@@ -35,7 +35,7 @@ pub fn logger(ctx: *Context, next: *const fn (ctx: *Context) anyerror!void) anye
     const start = std.Io.Timestamp.toMilliseconds(
         std.Io.Timestamp.now(io, .awake),
     );
-    ctx.start_ns = start;
+    ctx.start_ms = start;
     next(ctx) catch |err| {
         ctx.status = .internal_server_error;
         std.debug.print("[HTTP] {s} {s} → {d} (error: {t})\n", .{
@@ -75,15 +75,24 @@ pub fn cors(comptime options: CorsOptions) Middleware {
         fn handler(ctx: *Context, next: *const fn (ctx: *Context) anyerror!void) anyerror!void {
             const res = ctx.res orelse return;
             const allocator = res.headers.entries.allocator;
+            const is_wildcard = AllowedOrigin.len > 0 and AllowedOrigin[0] == '*';
 
             // CORS 헤더 설정
             try res.setHeader("Access-Control-Allow-Origin", AllowedOrigin);
+            // 특정 origin일 때 Vary: Origin 설정 (캐시 포이즈닝 방지)
+            if (!is_wildcard) {
+                try res.setHeader("Vary", "Origin");
+            }
             const methods = try std.mem.join(allocator, ", ", AllowedMethods);
             try res.setHeader("Access-Control-Allow-Methods", methods);
             const headers = try std.mem.join(allocator, ", ", AllowedHeaders);
             try res.setHeader("Access-Control-Allow-Headers", headers);
             if (AllowCredentials) {
-                res.setHeader("Access-Control-Allow-Credentials", "true") catch {};
+                // credentials=true + wildcard는 브라우저가 거부하므로
+                // wildcard가 아닐 때만 credentials 헤더 설정
+                if (!is_wildcard) {
+                    res.setHeader("Access-Control-Allow-Credentials", "true") catch {};
+                }
             }
             if (MaxAge) |age| {
                 const age_str = try std.fmt.allocPrint(allocator, "{d}", .{age});
@@ -143,7 +152,7 @@ test "middleware — cors sets configured headers" {
         .method = .GET,
         .path = "/",
         .status = .ok,
-        .start_ns = 0,
+        .start_ms = 0,
         .body_size = 0,
         .io = undefined,
         .res = &res,
@@ -175,7 +184,7 @@ test "middleware — cors preflight ends chain" {
         .method = .OPTIONS,
         .path = "/",
         .status = .ok,
-        .start_ns = 0,
+        .start_ms = 0,
         .body_size = 0,
         .io = undefined,
         .res = &res,

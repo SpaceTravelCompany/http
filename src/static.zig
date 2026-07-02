@@ -41,8 +41,8 @@ pub const StaticServer = struct {
 
     /// Io와 함께 파일을 서빙한다.
     pub fn serveFromIo(self: *const StaticServer, io: std.Io, path: []const u8) !ServeResult {
-        // 보안: path traversal 방지
-        if (mem.indexOf(u8, path, "..") != null) return TraversalError.PathTraversal;
+        // 보안: path traversal 방지 (".." 세그먼트만 차단)
+        if (mem.indexOf(u8, path, "/../") != null or mem.endsWith(u8, path, "/..")) return TraversalError.PathTraversal;
         if (mem.indexOfAny(u8, path, "\\%00") != null) return TraversalError.PathTraversal;
 
         const allocator = self.allocator;

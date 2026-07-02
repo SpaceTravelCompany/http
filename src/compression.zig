@@ -25,6 +25,7 @@ pub fn negotiate(accept_encoding: ?[]const u8) Encoding {
     const header = accept_encoding orelse return .identity;
     var best = Encoding.identity;
     var best_q: u16 = 0;
+    var wildcard_q: u16 = 0;
 
     var it = mem.splitScalar(u8, header, ',');
     while (it.next()) |raw_token| {
@@ -36,16 +37,23 @@ pub fn negotiate(accept_encoding: ?[]const u8) Encoding {
         const q = parseQ(token[semi..]) orelse 1000;
         if (q == 0) continue;
 
-        if (std.ascii.eqlIgnoreCase(name, "gzip") or mem.eql(u8, name, "*")) {
+        if (std.ascii.eqlIgnoreCase(name, "gzip")) {
             if (q > best_q) {
                 best = .gzip;
                 best_q = q;
             }
-        } else if (std.ascii.eqlIgnoreCase(name, "identity") and best == .identity) {
+        } else if (std.ascii.eqlIgnoreCase(name, "identity")) {
             best_q = @max(best_q, q);
+        } else if (mem.eql(u8, name, "*")) {
+            // wildcard: 명시적으로 언급되지 않은 인코딩의 fallback
+            wildcard_q = @max(wildcard_q, q);
         }
     }
 
+    // gzip이 명시적으로 선택되지 않고 wildcard q가 더 높으면 identity 유지
+    if (best == .identity and best_q >= wildcard_q) return .identity;
+    // wildcard q가 identity/gzip q보다 높으면 gzip 사용 (gzip이 지원된다고 가정)
+    if (wildcard_q > best_q and wildcard_q > 0) return .gzip;
     return best;
 }
 

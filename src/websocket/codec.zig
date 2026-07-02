@@ -321,7 +321,7 @@ pub const Reader = struct {
                 const parsed = decodeClosePayload(payload_raw);
                 if (!parsed.valid) {
                     var buf: [128]u8 = undefined;
-                    const encoded = encodeClosePayload(CloseCode{ .protocol_error = 1002 }, "", &buf);
+                    const encoded = encodeClosePayload(.protocol_error, "", &buf);
                     try self.sendControlFrame(.close, encoded);
                     self.pending_close = CloseReason{ .code = @enumFromInt(@as(u16, 1002)), .reason = "" };
                     return error.ProtocolError;
@@ -360,13 +360,15 @@ pub const Reader = struct {
 
             switch (frame.opcode) {
                 .text, .binary => {
-                    if (frame.opcode == .text) {
+                    // 단일 프레임(text)은 즉시 UTF-8 검증 (RFC 6455 §6.1)
+                    if (frame.opcode == .text and frame.fin) {
                         if (!std.unicode.utf8ValidateSlice(frame.payload)) return error.UnsupportedData;
                     }
                     if (frame.fin) {
                         const data = try allocator.dupe(u8, frame.payload);
                         return Message{ .data = data, .opcode = frame.opcode, .owned = true };
                     } else {
+                        // fragmentation 시작: per-frame 검증하지 않고 조립 완료 시 검증
                         if (self.frag_opcode != null) return error.ProtocolError;
                         if (frame.payload.len > self.max_message_size) return error.MessageOversize;
                         self.frag_opcode = frame.opcode;
@@ -376,9 +378,6 @@ pub const Reader = struct {
                 },
                 .continuation => {
                     const active_opcode = self.frag_opcode orelse return error.ProtocolError;
-                    if (active_opcode == .text) {
-                        if (!std.unicode.utf8ValidateSlice(frame.payload)) return error.UnsupportedData;
-                    }
                     const new_len = self.frag_assembly.items.len + frame.payload.len;
                     if (new_len > self.max_message_size) {
                         self.frag_opcode = null;
@@ -388,6 +387,10 @@ pub const Reader = struct {
                     try self.frag_assembly.ensureUnusedCapacity(self.allocator, frame.payload.len);
                     self.frag_assembly.appendSliceAssumeCapacity(frame.payload);
                     if (frame.fin) {
+                        // 조립 완료 시 UTF-8 검증 (멀티바이트 문자가 프레임 경계에 걸칠 수 있으므로)
+                        if (active_opcode == .text) {
+                            if (!std.unicode.utf8ValidateSlice(self.frag_assembly.items)) return error.UnsupportedData;
+                        }
                         const data = try allocator.dupe(u8, self.frag_assembly.items);
                         const result_opcode = active_opcode;
                         self.frag_opcode = null;
@@ -445,7 +448,7 @@ test "codec — computeAcceptKey RFC 6455 §1.3" {
 
 test "codec — encodeClosePayload / decodeClosePayload" {
     var buf: [128]u8 = undefined;
-    const encoded = encodeClosePayload(CloseCode{ .normal = 1000 }, "bye", &buf);
+    const encoded = encodeClosePayload(.normal, "bye", &buf);
     const parsed = decodeClosePayload(encoded);
     try expect(parsed.valid);
     try expectEqual(@intFromEnum(CloseCode.normal), @intFromEnum(parsed.code));

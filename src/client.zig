@@ -42,8 +42,8 @@ pub const HttpClient = struct {
     }
 
     /// GET + JSON 파싱 한 줄 (chzzk bot get_json 패턴)
-    /// 최적화: arena로 fetch 수명 관리 → caller allocator는 최종 JSON만 소유.
-    pub fn getJson(self: *HttpClient, comptime T: type, allocator: std.mem.Allocator, url: []const u8) !T {
+    /// 반환된 Parsed(T)의 deinit()을 호출자가 해제해야 한다.
+    pub fn getJson(self: *HttpClient, comptime T: type, allocator: std.mem.Allocator, url: []const u8) !std.json.Parsed(T) {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const aa = arena.allocator();
@@ -55,12 +55,12 @@ pub const HttpClient = struct {
 
         if (response.status != .ok and response.status != .no_content) return error.HttpError;
 
-        return std.json.parseFromSliceLeaky(T, allocator, response.body, .{ .allocate = .alloc_always });
+        return std.json.parseFromSlice(T, allocator, response.body, .{ .allocate = .alloc_always });
     }
 
     /// POST + JSON body + 응답 파싱 (chzzk bot post_json 패턴)
-    /// 최적화: arena로 fetch + body_json 수명 관리.
-    pub fn postJson(self: *HttpClient, comptime T: type, allocator: std.mem.Allocator, url: []const u8, body: anytype) !T {
+    /// 반환된 Parsed(T)의 deinit()을 호출자가 해제해야 한다.
+    pub fn postJson(self: *HttpClient, comptime T: type, allocator: std.mem.Allocator, url: []const u8, body: anytype) !std.json.Parsed(T) {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const aa = arena.allocator();
@@ -76,7 +76,7 @@ pub const HttpClient = struct {
 
         if (response.status != .ok and response.status != .created and response.status != .no_content) return error.HttpError;
 
-        return std.json.parseFromSliceLeaky(T, allocator, response.body, .{ .allocate = .alloc_always });
+        return std.json.parseFromSlice(T, allocator, response.body, .{ .allocate = .alloc_always });
     }
 
     /// 범용 fetch: 원샷 HTTP 요청. body 버퍼링.
@@ -92,14 +92,13 @@ pub const HttpClient = struct {
         const uri = try std.Uri.parse(opts.url);
 
         // retry 루프: 네트워크 에러/5xx는 메서드 무관하게 재시도
-        const max_retries: u32 = 3;
-        var last_err: ?anyerror = null;
+        const max_attempts: u32 = 3;
 
-        var retry_i: u32 = 0;
-        while (retry_i < max_retries) : (retry_i += 1) {
-            if (retry_i > 0) {
+        var attempt: u32 = 0;
+        while (attempt < max_attempts) : (attempt += 1) {
+            if (attempt > 0) {
                 // 지수 백오프 (1s, 2s, 4s) + 100ms jitter
-                const delay_ms = (@as(u64, 1) << @as(u6, @intCast(retry_i - 1))) * 1000;
+                const delay_ms = (@as(u64, 1) << @as(u6, @intCast(attempt - 1))) * 1000;
                 var jitter_buf: [1]u8 = undefined;
                 self.client.io.random(&jitter_buf);
                 const jitter = @as(u64, jitter_buf[0]) * 100 / 256; // 0~99 범위
@@ -124,8 +123,7 @@ pub const HttpClient = struct {
             var req = self.client.request(opts.method, uri, .{
                 .extra_headers = req_headers,
             }) catch |err| {
-                last_err = err;
-                if (isRetryableError(err) and retry_i + 1 < max_retries) continue;
+                if (isRetryableError(err) and attempt + 1 < max_attempts) continue;
                 return err;
             };
             defer req.deinit();
@@ -134,14 +132,12 @@ pub const HttpClient = struct {
                 const request_body = try allocator.dupe(u8, body);
                 defer allocator.free(request_body);
                 req.sendBodyComplete(request_body) catch |err| {
-                    last_err = err;
-                    if (isRetryableError(err) and retry_i + 1 < max_retries) continue;
+                    if (isRetryableError(err) and attempt + 1 < max_attempts) continue;
                     return err;
                 };
             } else {
                 req.sendBodiless() catch |err| {
-                    last_err = err;
-                    if (isRetryableError(err) and retry_i + 1 < max_retries) continue;
+                    if (isRetryableError(err) and attempt + 1 < max_attempts) continue;
                     return err;
                 };
             }
@@ -149,8 +145,7 @@ pub const HttpClient = struct {
             // 응답 헤더 수신
             var redirect_buf: [8192]u8 = undefined;
             var std_response = req.receiveHead(&redirect_buf) catch |err| {
-                last_err = err;
-                if (isRetryableError(err) and retry_i + 1 < max_retries) continue;
+                if (isRetryableError(err) and attempt + 1 < max_attempts) continue;
                 return err;
             };
 
@@ -158,13 +153,12 @@ pub const HttpClient = struct {
 
             // 응답 본문 읽기
             const body = readResponseBody(allocator, &req, &std_response) catch |err| {
-                last_err = err;
-                if (isRetryableError(err) and retry_i + 1 < max_retries) continue;
+                if (isRetryableError(err) and attempt + 1 < max_attempts) continue;
                 return err;
             };
 
             // 5xx 재시도
-            if (isServerError(status) and retry_i + 1 < max_retries) {
+            if (isServerError(status) and attempt + 1 < max_attempts) {
                 allocator.free(body);
                 continue;
             }
@@ -176,7 +170,8 @@ pub const HttpClient = struct {
             };
         }
 
-        return last_err orelse error.HttpError;
+        // while 루프의 모든 경로가 return이므로 도달 불가
+        unreachable;
     }
 
     pub fn rawClient(self: *HttpClient) *std.http.Client {
@@ -223,13 +218,6 @@ pub const Response = struct {
 // ─────────────────────────────────────────────────────────────────────
 //  헬퍼
 // ─────────────────────────────────────────────────────────────────────
-
-fn isIdempotent(method: http.Method) bool {
-    return switch (method) {
-        .GET, .PUT, .DELETE, .HEAD, .OPTIONS, .TRACE => true,
-        else => false,
-    };
-}
 
 fn isServerError(status: http.Status) bool {
     const code = @intFromEnum(status);
@@ -379,29 +367,15 @@ fn readBodyReaderAlloc(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]
     return try out.toOwnedSlice();
 }
 
-fn skipNetworkTests() bool {
-    return true;
-}
-
-test "client — public request methods compile" {
-    if (skipNetworkTests()) return error.SkipZigTest;
-
+test "client — public methods compile" {
     var client = try HttpClient.init(testing.allocator, std.testing.io);
     defer client.deinit();
 
-    const Payload = struct { ok: bool };
-    var get_response = try client.fetch(testing.allocator, .{ .url = "http://127.0.0.1/" });
-    defer get_response.deinit();
-    _ = try client.getJson(Payload, testing.allocator, "http://127.0.0.1/");
-    _ = try client.postJson(Payload, testing.allocator, "http://127.0.0.1/", Payload{ .ok = true });
-}
-
-test "client — isIdempotent" {
-    try testing.expect(isIdempotent(.GET));
-    try testing.expect(isIdempotent(.PUT));
-    try testing.expect(isIdempotent(.DELETE));
-    try testing.expect(!isIdempotent(.POST));
-    try testing.expect(!isIdempotent(.PATCH));
+    // 메서드 시그니처 컴파일 확인 (네트워크 없이)
+    _ = HttpClient.fetch;
+    _ = HttpClient.rawClient;
+    _ = HttpClient.getJson;
+    _ = HttpClient.postJson;
 }
 
 test "client — isServerError" {

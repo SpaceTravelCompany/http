@@ -154,7 +154,7 @@ pub const WsStream = struct {
         const expected_accept = codec.computeAcceptKey(&key_b64);
         var accept_found = false;
         {
-            var it = response.iterateHeaders();
+            var it = response.head.iterateHeaders();
             while (it.next()) |hdr| {
                 if (std.ascii.eqlIgnoreCase(hdr.name, "sec-websocket-accept")) {
                     const trimmed = mem.trim(u8, hdr.value, " \t");
@@ -171,7 +171,7 @@ pub const WsStream = struct {
         var selected_protocol: ?[]u8 = null;
         errdefer if (selected_protocol) |p| allocator.free(p);
         {
-            var it = response.iterateHeaders();
+            var it = response.head.iterateHeaders();
             while (it.next()) |hdr| {
                 if (std.ascii.eqlIgnoreCase(hdr.name, "sec-websocket-protocol")) {
                     if (opts.protocols.len == 0) return error.HandshakeFailed;

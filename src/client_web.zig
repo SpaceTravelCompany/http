@@ -126,9 +126,13 @@ pub const WebHttpClient = struct {
     }
 
     /// 네이티브 `fetch`와 같은 Response 타입을 반환하되, 브라우저에서는 완료된 handle만 처리한다.
+    /// 완료되지 않은 요청의 handle은 자동으로 해제된다.
     pub fn fetch(self: *WebHttpClient, allocator: std.mem.Allocator, opts: FetchOptions) !Response {
         const handle = try self.fetchAsync(opts);
-        if (self.requestStatus(handle) != .complete) return error.Pending;
+        if (self.requestStatus(handle) != .complete) {
+            self.destroyRequest(handle);
+            return error.Pending;
+        }
         return try self.response(allocator, handle);
     }
 
@@ -143,12 +147,11 @@ pub const WebHttpClient = struct {
     }
 
     /// 완료된 요청의 JSON 결과를 파싱한다.
-    pub fn result(self: *WebHttpClient, comptime T: type, handle: u32) !T {
+    /// 반환된 Parsed(T)의 deinit()을 호출자가 해제해야 한다.
+    pub fn result(self: *WebHttpClient, comptime T: type, handle: u32) !std.json.Parsed(T) {
         var res = try self.response(self.allocator, handle);
         defer res.deinit();
-        var parsed = try res.json(T, self.allocator);
-        defer parsed.deinit();
-        return parsed.value;
+        return try res.json(T, self.allocator);
     }
 
     /// 완료된 요청의 Response를 복사해 가져온다.
@@ -217,7 +220,8 @@ const testing = std.testing;
 test "client_web — init/deinit" {
     var client = WebHttpClient.init(testing.allocator);
     defer client.deinit();
-    try testing.expect(client.allocator == testing.allocator);
+    try testing.expect(client.allocator.ptr == testing.allocator.ptr);
+    try testing.expect(client.allocator.vtable == testing.allocator.vtable);
 }
 
 test "client_web — poll noop" {

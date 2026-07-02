@@ -222,6 +222,22 @@ pub const server = if (is_native) @import("server.zig") else @import("server_stu
 pub const client_web = @import("client_web.zig");
 pub const websocket_web = @import("websocket_web.zig");
 
+// 서브모듈 강제 참조 — Zig 0.16 lazy analysis에서 서브모듈 테스트 블록이
+// 의미론적 분석 대상에 포함되도록 한다. 이게 없으면 `zig build test`에서
+// mod.zig의 테스트만 실행되고 서브모듈의 91개 테스트는 누락된다.
+comptime {
+    _ = cookie;
+    _ = compression;
+    _ = middleware;
+    _ = template;
+    _ = upload;
+    _ = static;
+    _ = websocket;
+    _ = client;
+    _ = client_web;
+    _ = websocket_web;
+}
+
 // ─────────────────────────────────────────────────────────────────────
 //  테스트
 // ─────────────────────────────────────────────────────────────────────

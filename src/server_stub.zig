@@ -15,7 +15,7 @@ pub const Context = struct {
     method: http.Method,
     path: []const u8,
     status: http.Status,
-    start_ns: i64,
+    start_ms: i64,
     body_size: usize,
 };
 

@@ -36,6 +36,34 @@ pub fn render(allocator: std.mem.Allocator, tmpl: []const u8, vars: anytype) ![]
         };
 
         try result.appendSlice(allocator, tmpl[pos..open]);
+
+        // {{{raw}}} — 원시 치환 (escape 없음)
+        if (open + 2 < tmpl.len and tmpl[open + 2] == '{') {
+            pos = open + 3;
+            const close = mem.indexOfPos(u8, tmpl, pos, "}}}") orelse {
+                try result.appendSlice(allocator, tmpl[open..]);
+                break;
+            };
+            const key = std.mem.trim(u8, tmpl[pos..close], " \t\r\n");
+            pos = close + 3;
+
+            var found = false;
+            inline for (fields) |field| {
+                if (mem.eql(u8, field.name, key)) {
+                    const value = @field(vars, field.name);
+                    try renderRawValue(allocator, &result, value, field.type);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                try result.appendSlice(allocator, "{{{ERROR:");
+                try result.appendSlice(allocator, key);
+                try result.appendSlice(allocator, "}}}");
+            }
+            continue;
+        }
+
         pos = open + 2;
 
         const close = mem.indexOfPos(u8, tmpl, pos, "}}") orelse {
@@ -70,6 +98,42 @@ pub fn render(allocator: std.mem.Allocator, tmpl: []const u8, vars: anytype) ![]
     }
 
     return result.toOwnedSlice(allocator);
+}
+
+fn renderRawValue(allocator: std.mem.Allocator, result: *std.ArrayList(u8), value: anytype, comptime T: type) !void {
+    const info = @typeInfo(T);
+
+    switch (info) {
+        .int, .comptime_int => {
+            var buf: [64]u8 = undefined;
+            const s = try std.fmt.bufPrint(&buf, "{d}", .{value});
+            try result.appendSlice(allocator, s);
+        },
+        .float, .comptime_float => {
+            var buf: [128]u8 = undefined;
+            const s = try std.fmt.bufPrint(&buf, "{d}", .{value});
+            try result.appendSlice(allocator, s);
+        },
+        .bool => {
+            try result.appendSlice(allocator, if (value) "true" else "false");
+        },
+        .optional => {
+            if (value) |v| {
+                try renderRawValue(allocator, result, v, @TypeOf(v));
+            }
+        },
+        .pointer => {
+            if (comptime isStringType(T)) {
+                const slice: []const u8 = value;
+                try result.appendSlice(allocator, slice);
+            } else {
+                try result.appendSlice(allocator, "[value]");
+            }
+        },
+        else => {
+            try result.appendSlice(allocator, "[unsupported]");
+        },
+    }
 }
 
 fn renderValue(allocator: std.mem.Allocator, result: *std.ArrayList(u8), value: anytype, comptime T: type) !void {
