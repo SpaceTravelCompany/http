@@ -6,7 +6,7 @@
 //! ## retry 정책
 //!
 //! - 5xx 또는 네트워크 에러 시 재시도
-//! - idempotent 메서드(GET/PUT/DELETE)만 3회 재시도
+    //! - 네트워크 에러/5xx는 메서드 무관하게 3회 재시도
 //! - 지수 백오프 (1s, 2s, 4s) + 100ms jitter
 
 const std = @import("std");
@@ -91,8 +91,8 @@ pub const HttpClient = struct {
     fn fetchInternal(self: *HttpClient, allocator: std.mem.Allocator, opts: FetchOptions) !Response {
         const uri = try std.Uri.parse(opts.url);
 
-        // retry 루프
-        const max_retries: u32 = if (isIdempotent(opts.method)) 3 else 1;
+        // retry 루프: 네트워크 에러/5xx는 메서드 무관하게 재시도
+        const max_retries: u32 = 3;
         var last_err: ?anyerror = null;
 
         var retry_i: u32 = 0;
@@ -125,7 +125,7 @@ pub const HttpClient = struct {
                 .extra_headers = req_headers,
             }) catch |err| {
                 last_err = err;
-                if (isRetryableNetworkError(err) and retry_i + 1 < max_retries) continue;
+                if (isRetryableError(err) and retry_i + 1 < max_retries) continue;
                 return err;
             };
             defer req.deinit();
@@ -135,13 +135,13 @@ pub const HttpClient = struct {
                 defer allocator.free(request_body);
                 req.sendBodyComplete(request_body) catch |err| {
                     last_err = err;
-                    if (isRetryableNetworkError(err) and retry_i + 1 < max_retries) continue;
+                    if (isRetryableError(err) and retry_i + 1 < max_retries) continue;
                     return err;
                 };
             } else {
                 req.sendBodiless() catch |err| {
                     last_err = err;
-                    if (isRetryableNetworkError(err) and retry_i + 1 < max_retries) continue;
+                    if (isRetryableError(err) and retry_i + 1 < max_retries) continue;
                     return err;
                 };
             }
@@ -150,7 +150,7 @@ pub const HttpClient = struct {
             var redirect_buf: [8192]u8 = undefined;
             var std_response = req.receiveHead(&redirect_buf) catch |err| {
                 last_err = err;
-                if (isRetryableNetworkError(err) and retry_i + 1 < max_retries) continue;
+                if (isRetryableError(err) and retry_i + 1 < max_retries) continue;
                 return err;
             };
 
@@ -159,7 +159,7 @@ pub const HttpClient = struct {
             // 응답 본문 읽기
             const body = readResponseBody(allocator, &req, &std_response) catch |err| {
                 last_err = err;
-                if (isRetryableNetworkError(err) and retry_i + 1 < max_retries) continue;
+                if (isRetryableError(err) and retry_i + 1 < max_retries) continue;
                 return err;
             };
 
@@ -236,10 +236,11 @@ fn isServerError(status: http.Status) bool {
     return code >= 500 and code < 600;
 }
 
-fn isRetryableNetworkError(err: anyerror) bool {
+fn isRetryableError(err: anyerror) bool {
     return switch (err) {
         error.ConnectionRefused, error.TlsInitializationFailed, error.BrokenPipe,
-        error.ConnectionResetByPeer, error.ConnectionTimedOut, error.Unexpected => true,
+        error.ConnectionResetByPeer, error.ConnectionTimedOut, error.Unexpected,
+        error.ReadFailed => true,
         else => false,
     };
 }
