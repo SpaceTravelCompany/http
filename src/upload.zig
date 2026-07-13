@@ -222,6 +222,9 @@ test "upload — parseMultipart minimal" {
 
 test "upload — max size exceeded" {
     const allocator = testing.allocator;
-    const large_body = [_]u8{0} ** (MAX_UPLOAD_SIZE + 1);
-    try testing.expectError(error.PayloadTooLarge, parseMultipart(allocator, "multipart/form-data; boundary=x", &large_body));
+    // 100MB+1 정적 배열은 스택을 넘친다(리눅스 기본 8MB). 힙에 잡는다.
+    const large_body = try allocator.alloc(u8, MAX_UPLOAD_SIZE + 1);
+    defer allocator.free(large_body);
+    @memset(large_body, 0);
+    try testing.expectError(error.PayloadTooLarge, parseMultipart(allocator, "multipart/form-data; boundary=x", large_body));
 }

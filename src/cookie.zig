@@ -192,7 +192,17 @@ fn nowMs() i64 {
             const ns = @as(i96, ft) * 100 + @as(i96, std.time.epoch.windows) * std.time.ns_per_s;
             break :blk @intCast(@divTrunc(ns, std.time.ns_per_ms));
         },
+        .linux => blk: {
+            // libc 의존을 피하기 위해 vdso/syscall 직접 호출.
+            var ts: std.os.linux.timespec = undefined;
+            const rc = std.os.linux.clock_gettime(.REALTIME, &ts);
+            if (rc != 0) break :blk 0;
+            const sec = @as(i64, @intCast(ts.sec));
+            const nsec = @as(i64, @intCast(ts.nsec));
+            break :blk sec * std.time.ms_per_s + @divTrunc(nsec, std.time.ns_per_ms);
+        },
         else => blk: {
+            // libc 연결이 보장된 플랫폼만 이 경로 사용.
             const CLOCK_REALTIME = @as(u32, 0);
             var ts: std.c.timespec = undefined;
             const rc = std.c.clock_gettime(CLOCK_REALTIME, &ts);
